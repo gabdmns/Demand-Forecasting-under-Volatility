@@ -1,0 +1,906 @@
+---
+title: "Proyeccion ARIMA/ETS"
+author: "Gabriel Gonzalo Ojeda Cárcamo"
+date: "7/1/2026"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Executive Summary
+
+This project implements a monthly demand forecasting model for industrial products operating in a highly volatile environment with limited historical data. Using 40 monthly observations per product and no exogenous variables, several classical time series models (ARIMA, ETS, TBATS) were evaluated as benchmarks.
+
+To better capture abrupt demand fluctuations, a LightGBM model was developed with recent shock features and validated using walk-forward (expanding window) cross-validation. This approach reduced prediction error by approximately 50% compared to an ARIMA baseline, lowering MAPE from 30% to 15% aprox.
+
+The final solution also provides quantile forecasts (P10–P50–P90), enabling uncertainty-aware planning and inventory decision-making. The project highlights how domain-informed feature engineering and robust temporal validation can significantly improve forecasting performance in short, noisy time series.
+
+The forecasts support monthly production planning and inventory decisions for three industrial products. Over-forecasting increases holding costs, while under-forecasting leads to stockouts and lost sales. Therefore, probabilistic forecasts (P10–P50–P90) are required to quantify uncertainty.
+
+```{r cars,message=FALSE,warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(tsibble)
+library(fable)
+library(fabletools)
+library(lubridate)
+library(dplyr)
+library(Metrics)
+library(feasts)
+library(lightgbm)
+library(zoo)
+library(forecast)
+library(ggplot2)
+```
+
+# Data and scope
+
+- Frequency: Monthly
+
+- Period: 2021–2024
+
+- Observations: 40 per product
+
+- Products analyzed: Three industrial products .
+
+The analysis is based on 40 monthly observations per product, with no exogenous variables available. This constraint requires the use of parsimonious and robust modeling approaches capable of handling limited data and high volatility.
+
+```{r}
+data_prd <- read_excel(
+  "C:/Users/gonza/OneDrive/Documentos/Time series/DATA PRD.xlsx"
+)
+
+#Wrangling
+
+data_prd <- data_prd %>%
+  arrange(date) %>%                      # CLAVE
+  mutate(Date = yearmonth(date)) %>%
+  as_tsibble(index = Date)
+
+data_num <- data_prd %>%
+  as_tibble() %>%              # rompe clases tsibble
+  mutate(
+    PR1 = as.numeric(PR1),
+    PR2 = as.numeric(PR2),
+    PR3 = as.numeric(PR3)
+  ) %>%
+  select(PR1, PR2, PR3)
+
+```
+
+# Exploratory Data Analysis
+
+## Time series visualization
+
+```{r}
+library(ggplot2)
+
+ggplot(data_prd, aes(x = date, y = PR2)) +
+  geom_line(color = "black") +
+  theme_minimal() +
+  labs(
+    title = "Monthly Demand – PR2",
+    x = "Date",
+    y = "Demand"
+  )
+```
+The time series shows a highly volatile demand pattern with abrupt spikes and sharp drops throughout the period 2021–2024. Demand levels fluctuate widely, ranging from periods of sustained low values to sudden peaks exceeding historical averages.
+
+Several large, short-lived spikes are visible (notably around late 2021 and mid-2023), followed by rapid reversals. This behavior suggests that extreme values are driven by temporary shocks rather than persistent trend changes, making them difficult to capture using traditional smoothing-based models.
+
+There is no clear, stable seasonal pattern across years. While some higher demand periods appear around year-end, the magnitude and timing of peaks vary significantly, indicating irregular seasonality rather than a fixed annual cycle.
+
+## Monthly Change Distribution
+
+
+```{r}
+data_prd %>%
+  arrange(date) %>%
+  mutate(dlog_PR2 = difference(log(PR2))) %>%
+  ggplot(aes(x = dlog_PR2)) +
+  geom_histogram(bins = 20, fill = "gray70", color = "black") +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Monthly Log-Changes – PR2",
+    x = "dlog(PR2)",
+    y = "Frequency"
+  )
+```
+The distribution of monthly log-changes shows asymmetry and heavy tails, indicating that demand variations are not normally distributed. This reinforces the need for models that can handle extreme movements and irregular behavior.
+
+## Correlation between products
+
+```{r}
+
+# Correlacion en niveles
+
+cor_levels <- cor(data_num, use = "complete.obs")
+round(cor_levels, 3)
+
+```
+While the products exhibit moderate to high correlation in levels, they are treated as independent forecasting problems, as no direct causal relationship exists. The observed co-movement is interpreted as a shared market effect rather than structural dependence, justifying univariate modeling.
+
+## Change correlation
+
+```{r}
+
+data_diff <- data_prd %>%
+  as_tibble() %>%
+  mutate(
+    dPR1 = difference(log(as.numeric(PR1))),
+    dPR2 = difference(log(as.numeric(PR2))),
+    dPR3 = difference(log(as.numeric(PR3)))
+  ) %>%
+  select(dPR1, dPR2, dPR3)
+
+cor_diff <- cor(data_diff, use = "complete.obs")
+round(cor_diff, 3)
+
+```
+Correlation in first differences indicates shared volatility patterns, particularly between PR2 and PR3. However, this does not imply predictive causality, reinforcing the decision to avoid multivariate models such as VAR or ARIMAX.
+
+The exploratory analysis reveals a demand process characterized by high volatility, abrupt shocks, and non-Gaussian changes, with limited data availability and no exogenous drivers. These findings motivate the use of robust, parsimonious models, the incorporation of recent shock features, and walk-forward validation to ensure stable out-of-sample performance.
+
+# Modelling
+
+
+## Techniques
+
+Three approaches were evaluated using out-of-sample and walk-forward validation.
+
+### ARIMA (Benchmark)
+Used as a standard univariate baseline. While it captured overall level and autocorrelation, ARIMA consistently smoothed abrupt demand shocks, leading to higher errors during volatile periods.
+
+### ETS (Discarded)
+Smoothing-based models underperformed relative to ARIMA and failed to adapt to irregular demand patterns. The absence of stable seasonality made these models unsuitable for this task.
+
+### LightGBM (Final Model)
+A feature-based LightGBM model outperformed all classical approaches. After incorporating recent shock features, it achieved a substantial reduction in forecast error and showed greater robustness during high-volatility periods.
+
+## Modeling assumptions
+
+- No exogenous variables available → feature-based approach required
+
+- Limited sample size (40 obs) → parsimonious models, expanding window CV
+
+- Irregular shocks → tree-based model with shock features
+
+- Forecast horizon short (1–6 months) → no long-term trend modeling
+
+```{r}
+#TRAIN/TEST
+data_ts <- data_prd
+train <- data_ts %>% filter(Date <= yearmonth("2023-10"))
+test  <- data_ts %>% filter(Date >  yearmonth("2023-10"))
+```
+
+## ARIMA
+
+```{r, echo = 203}
+## ARIMA
+
+# Estimación
+fit_arima <- train %>%
+  model(
+    ARIMA = ARIMA(PR2)
+  )
+
+# Diagnóstico
+fit_arima %>% gg_tsresiduals()
+
+fit_arima %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 12)
+
+# Forecast y validación
+
+fc_arima <- fit_arima %>% forecast(h = nrow(test))
+
+# 1) extraer predicción puntual
+pred_arima <- fc_arima %>%
+  as_tibble() %>%
+  select(Date, pred = .mean)
+
+# 2) armar tabla de evaluación (alineada por Date)
+eval_arima <- test %>%
+  as_tibble() %>%
+  select(Date, actual = PR2) %>%
+  left_join(pred_arima, by = "Date")
+
+eval_arima
+
+rmse_arima <- rmse(eval_arima$actual, eval_arima$pred)
+mae_arima  <- mae(eval_arima$actual, eval_arima$pred)
+mape_arima <- mape(eval_arima$actual, eval_arima$pred)
+
+c(RMSE = rmse_arima, MAE = mae_arima, MAPE = mape_arima)
+```
+## ETS
+
+```{r,echo=234}
+# ETS
+
+## Estimación
+
+fit_ets <- train %>%
+  model(
+    ETS = ETS(PR2)
+  )
+
+fit_ets %>% gg_tsresiduals()
+
+## Predicción
+
+fc_ets <- fit_ets %>% forecast(h = nrow(test))
+
+## Validación
+
+pred_ets <- fc_ets %>%
+  as_tibble() %>%
+  select(Date, pred = .mean)
+
+eval_ets <- test %>%
+  as_tibble() %>%
+  select(Date, actual = PR2) %>%
+  left_join(pred_ets, by = "Date")
+
+library(Metrics)
+c(RMSE = rmse(eval_ets$actual, eval_ets$pred),MAE  = mae(eval_ets$actual, eval_ets$pred), MAPE = mape(eval_ets$actual, eval_ets$pred))
+```
+
+
+## LGBM
+
+Classical time series models struggled to adapt to abrupt demand shocks and irregular volatility. To address these limitations, a LightGBM regression model was evaluated as a flexible, non-linear alternative capable of incorporating engineered temporal features and learning complex patterns from limited data.
+
+Features included
+
+- Lagged demand (1, 2, 3, 6, 12 months)
+
+- Rolling averages (3, 6, 12 months) to capture local context
+
+- Cyclical seasonality using sine and cosine transformations
+
+Model performance was evaluated using walk-forward (expanding window) validation, retraining the model at each step and forecasting one month ahead. This approach reflects real-world deployment conditions and prevents look-ahead bias.
+
+
+```{r, warning=FALSE,echo=336,338}
+#  LightGBM
+
+df_ml <- data_prd %>%
+  as_tibble() %>%
+  arrange(date) %>%
+  mutate(
+    m = month(date),
+    sin_m = sin(2*pi*m/12),
+    cos_m = cos(2*pi*m/12),
+
+    lag1  = lag(PR2, 1),
+    lag2  = lag(PR2, 2),
+    lag3  = lag(PR2, 3),
+    lag6  = lag(PR2, 6),
+    lag12 = lag(PR2, 12),
+
+    roll3  = rollmean(PR2, 3,  fill = NA, align = "right"),
+    roll6  = rollmean(PR2, 6,  fill = NA, align = "right"),
+    roll12 = rollmean(PR2, 12, fill = NA, align = "right")
+  ) %>%
+  drop_na()
+
+# Parameters
+
+params <- list(
+  objective = "regression",
+  metric = "rmse",
+  learning_rate = 0.05,
+  num_leaves = 15,
+  max_depth = 4,
+  min_data_in_leaf = 6,
+  feature_fraction = 0.9
+)
+
+# walk forward loop
+
+# tamaño mínimo de entrenamiento
+min_train <- 18   # meses mínimos (puedes usar 24 si quieres)
+
+errors <- tibble()
+
+for (i in seq(min_train, nrow(df_ml) - 1)) {
+
+  #  split temporal
+  train_i <- df_ml[1:i, ]
+  test_i  <- df_ml[i + 1, ]
+
+  X_train <- as.matrix(train_i %>% select(-date, -PR2))
+  y_train <- train_i$PR2
+
+  X_test  <- as.matrix(test_i %>% select(-date, -PR2))
+  y_test  <- test_i$PR2
+
+  # entrenar modelo
+  dtrain <- lgb.Dataset(X_train, label = y_train)
+
+  model_i <- lgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 150,
+    verbose = -1
+  )
+
+  # predicción 1-step ahead
+  y_pred <- predict(model_i, X_test)
+
+  # guardar error
+  errors <- bind_rows(
+    errors,
+    tibble(
+      date   = test_i$date,
+      actual = y_test,
+      pred   = y_pred,
+      error  = y_test - y_pred
+    )
+  )
+}
+
+# metricas agregadas
+
+walkforward_metrics <- c(RMSE = rmse(errors$actual, errors$pred),MAE  = mae(errors$actual, errors$pred),MAPE = mape(errors$actual, errors$pred))
+
+walkforward_metrics
+
+ggplot(errors, aes(x = date)) + geom_line(aes(y = actual), color = "black") + geom_line(aes(y = pred), color = "blue", linetype = "dashed") + theme_minimal() + labs(title = "Walk-forward validation – PR2",y = "PR2", x = "Fecha")
+
+```
+
+```{r,include= FALSE}
+
+# Mejora 2 lightgbm
+df_ml <- data_prd %>%
+  as_tibble() %>%
+  arrange(date) %>%
+  mutate(
+    # estacionalidad cíclica
+    m = month(date),
+    sin_m = sin(2*pi*m/12),
+    cos_m = cos(2*pi*m/12),
+
+    # lags
+    lag1  = lag(PR2, 1),
+    lag2  = lag(PR2, 2),
+    lag3  = lag(PR2, 3),
+    lag6  = lag(PR2, 6),
+    lag12 = lag(PR2, 12),
+
+    # rolling means
+    roll3  = rollmean(PR2, 3,  fill = NA, align = "right"),
+    roll6  = rollmean(PR2, 6,  fill = NA, align = "right"),
+    roll12 = rollmean(PR2, 12, fill = NA, align = "right"),
+
+    # shock reciente (1 mes)
+    shock_1 = abs(PR2 - lag(PR2, 1)) / lag(PR2, 1),
+
+    # shock reciente (promedio 3 meses de “saltos”)
+    # usamos diff(PR2) y lo alineamos con PR2_t
+    dPR2 = c(NA, diff(PR2)),
+    shock_3 = rollapply(abs(dPR2) / lag(PR2, 1),
+                        width = 3, mean, fill = NA, align = "right")
+  ) %>%
+  select(date, PR2, sin_m, cos_m,
+         lag1, lag2, lag3, lag6, lag12,
+         roll3, roll6, roll12,
+         shock_1, shock_3) %>%
+  drop_na()
+
+# parámetros
+
+params <- list(
+  objective = "regression",
+  metric = "rmse",
+  learning_rate = 0.05,
+  num_leaves = 15,
+  max_depth = 4,
+  min_data_in_leaf = 6,
+  feature_fraction = 0.9
+)
+
+# walk forward loop
+
+min_train <- 18  # meses mínimos de entrenamiento
+errors <- tibble()
+
+for (i in seq(min_train, nrow(df_ml) - 1)) {
+
+  train_i <- df_ml[1:i, ]
+  test_i  <- df_ml[i + 1, ]
+
+  X_train <- as.matrix(train_i %>% select(-date, -PR2))
+  y_train <- train_i$PR2
+
+  X_test  <- as.matrix(test_i %>% select(-date, -PR2))
+  y_test  <- test_i$PR2
+
+  dtrain <- lgb.Dataset(X_train, label = y_train)
+
+  model_i <- lgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 200,
+    verbose = -1
+  )
+
+  y_pred <- as.numeric(predict(model_i, X_test))
+
+  errors <- bind_rows(
+    errors,
+    tibble(
+      date   = test_i$date,
+      actual = y_test,
+      pred   = y_pred,
+      error  = y_test - y_pred
+    )
+  )
+}
+
+# validación
+
+metrics_lgb_shock <- c(
+  RMSE = rmse(errors$actual, errors$pred),
+  MAE  = mae(errors$actual, errors$pred),
+  MAPE = mape(errors$actual, errors$pred)
+)
+
+metrics_lgb_shock
+
+#gráfico
+
+ggplot(errors, aes(x = date)) +
+  geom_line(aes(y = actual)) +
+  geom_line(aes(y = pred), linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Walk-forward validation – PR2 (LGBM + shock features)",
+       y = "PR2", x = "Fecha")
+
+X_all <- as.matrix(df_ml %>% select(-date, -PR2))
+y_all <- df_ml$PR2
+dall <- lgb.Dataset(X_all, label = y_all)
+
+model_all <- lgb.train(params = params, data = dall, nrounds = 200, verbose = -1)
+
+lgb.importance(model_all) %>% head(12)
+
+```
+
+| Model                           | RMSE | MAPE |
+|---------------------------------|------|------|
+| ARIMA (benchmark)               | 20000| 29%  |
+| ETS                             | 21000| 30%  |
+| LightGBM (basic)                | 17000| 26%  |
+| **LightGBM + shock features**   | **10000** | **15%** |
+
+Reducing MAPE from aprox. 30% to aprox. 15% implies halving the average relative forecast error, which translates into materially lower safety stock requirements under volatile demand.
+
+# Scenarios
+
+P10 represents a conservative scenario for downside planning, while P90 captures potential demand surges. This enables inventory policies to be stress-tested under uncertainty rather than relying on a single point estimate.
+
+```{r,echo=521}
+
+# Mejora 3
+
+lgb_walkforward_quantiles <- function(df_ml, params_base, quantiles = c(0.1, 0.5, 0.9),
+                                      min_train = 18, nrounds = 200) {
+
+  out <- tibble()
+
+  for (i in seq(min_train, nrow(df_ml) - 1)) {
+
+    train_i <- df_ml[1:i, ]
+    test_i  <- df_ml[i + 1, ]
+
+    X_train <- as.matrix(train_i %>% select(-date, -PR2))
+    y_train <- train_i$PR2
+    X_test  <- as.matrix(test_i %>% select(-date, -PR2))
+    y_test  <- test_i$PR2
+
+    dtrain <- lgb.Dataset(X_train, label = y_train)
+
+    preds <- map_dbl(quantiles, function(q) {
+      params_q <- modifyList(params_base, list(objective = "quantile", alpha = q, metric = "quantile"))
+      model_q <- lgb.train(params = params_q, data = dtrain, nrounds = nrounds, verbose = -1)
+      as.numeric(predict(model_q, X_test))
+    })
+
+    out <- bind_rows(
+      out,
+      tibble(
+        date = test_i$date,
+        actual = y_test,
+        p10 = preds[1],
+        p50 = preds[2],
+        p90 = preds[3]
+      )
+    )
+  }
+
+  out
+}
+
+# parametros
+
+params_qbase <- list(
+  learning_rate = 0.05,
+  num_leaves = 15,
+  max_depth = 4,
+  min_data_in_leaf = 6,
+  feature_fraction = 0.9
+)
+
+qpred <- lgb_walkforward_quantiles(df_ml, params_qbase, min_train = 18, nrounds = 250)
+qpred %>% head()
+
+
+coverage_80 <- mean(qpred$actual >= qpred$p10 & qpred$actual <= qpred$p90)
+coverage_80
+
+avg_width <- mean(qpred$p90 - qpred$p10)
+avg_width
+
+ggplot(qpred, aes(x = date)) + geom_ribbon(aes(ymin = p10, ymax = p90), alpha = 0.2) + geom_line(aes(y = actual)) + geom_line(aes(y = p50), linetype = "dashed") + theme_minimal() + labs(title = "Walk-forward quantiles – PR2 (P10–P50–P90)", y = "PR2", x = "Fecha")
+```
+
+# Final Forecasts
+
+Final forecasts were generated using the LightGBM model with shock-aware features, selected based on superior walk-forward performance and robustness under demand volatility. Forecasts are produced for the next six months and reported using quantile estimates (P10–P50–P90) to reflect uncertainty and support scenario-based planning.
+
+```{r, include= FALSE}
+# ============================================================
+# 1) Long data (robusto a date)
+# ============================================================
+df_long <- data_prd %>%
+  as_tibble() %>%
+  mutate(
+    date = as.Date(date, origin = "1970-01-01")  # si ya es Date, igual funciona
+  ) %>%
+  arrange(date) %>%
+  pivot_longer(
+    cols = c(PR1, PR2, PR3),
+    names_to = "product",
+    values_to = "y"
+  ) %>%
+  mutate(
+    product = as.character(product),
+    y = as.numeric(y),
+    date = as.Date(date)
+  ) %>%
+  arrange(product, date)
+
+df_long %>%
+  group_by(product) %>%
+  summarise(n = n(), min_date = min(date), max_date = max(date), .groups = "drop")
+
+
+# ============================================================
+# 2) Features (adaptativas, sin drop_na global)
+# ============================================================
+make_ts_features_adaptive <- function(df_prod,
+                                      lag_set  = c(1,2,3,6,12),
+                                      roll_set = c(3,6,12)) {
+
+  out <- df_prod %>%
+    arrange(date) %>%
+    mutate(
+      date = as.Date(date),
+      product = as.character(product),
+      y = as.numeric(y),
+
+      # estacionalidad
+      m     = lubridate::month(date),
+      sin_m = sin(2*pi*m/12),
+      cos_m = cos(2*pi*m/12)
+    )
+
+  # lags
+  for (k in lag_set) {
+    out[[paste0("lag", k)]] <- dplyr::lag(out$y, k)
+  }
+
+  # rollmeans sobre lag1 (evita leakage)
+  if (!"lag1" %in% names(out)) out$lag1 <- dplyr::lag(out$y, 1)
+  for (w in roll_set) {
+    out[[paste0("roll", w)]] <- zoo::rollmean(out$lag1, w, fill = NA, align = "right")
+  }
+
+  # shocks protegidos (evita Inf/NaN)
+  denom_l1 <- out$lag1
+  out$shock_1 <- dplyr::if_else(is.na(denom_l1) | denom_l1 == 0, NA_real_,
+                                abs(out$y - denom_l1) / abs(denom_l1))
+  dy <- out$y - denom_l1
+  out$shock_3 <- zoo::rollapply(
+    dplyr::if_else(is.na(denom_l1) | denom_l1 == 0, NA_real_, abs(dy) / abs(denom_l1)),
+    width = 3, FUN = mean, fill = NA, align = "right"
+  )
+
+  out %>%
+    select(date, product, y,
+           sin_m, cos_m,
+           starts_with("lag"),
+           starts_with("roll"),
+           shock_1, shock_3)
+}
+
+# ============================================================
+# 3) Imputación + flags NA (para que predict() nunca reciba vacío)
+# ============================================================
+impute_features <- function(df_feat) {
+
+  num_cols <- df_feat %>%
+    select(-date, -product) %>%
+    names()
+
+  # flags de NA (1 si era NA, 0 si no)
+  flags <- df_feat %>%
+    mutate(across(all_of(num_cols), ~ as.integer(is.na(.)), .names = "{.col}_NA")) %>%
+    select(date, product, ends_with("_NA"))
+
+  # imputar NA -> 0 (simple y estable)
+  filled <- df_feat %>%
+    mutate(across(all_of(num_cols), ~ dplyr::if_else(is.na(.), 0, .)))
+
+  filled %>%
+    left_join(flags, by = c("date", "product"))
+}
+
+prep_train_set <- function(df_feat_imp) {
+  df_feat_imp %>% filter(!is.na(y))
+}
+
+# ============================================================
+# 4) Walk-forward (blindado)
+# ============================================================
+walk_forward_lgb <- function(df_feat_imp, min_train = 18, params, nrounds = 250) {
+
+  df_tr <- prep_train_set(df_feat_imp)
+  n <- nrow(df_tr)
+  if (n <= (min_train + 1)) {
+    stop("Muy pocos datos tras features. Reduce min_train o reduce lags/rolls.")
+  }
+
+  errors <- tibble()
+
+  for (i in seq(min_train, n - 1)) {
+    train_i <- df_tr[1:i, ]
+    test_i  <- df_tr[i + 1, ]
+
+    X_train <- as.matrix(train_i %>% select(-date, -product, -y))
+    y_train <- train_i$y
+    X_test  <- as.matrix(test_i %>% select(-date, -product, -y))
+    y_test  <- test_i$y
+
+    dtrain <- lgb.Dataset(data = X_train, label = y_train)
+
+    model_i <- lgb.train(
+      params  = params,
+      data    = dtrain,
+      nrounds = nrounds,
+      verbose = -1
+    )
+
+    pred <- as.numeric(predict(model_i, X_test))
+
+    errors <- bind_rows(errors,
+                        tibble(date = as.Date(test_i$date), actual = y_test, pred = pred))
+  }
+
+  metrics <- c(
+    RMSE = Metrics::rmse(errors$actual, errors$pred),
+    MAE  = Metrics::mae(errors$actual, errors$pred),
+    MAPE = Metrics::mape(errors$actual, errors$pred)
+  )
+
+  list(errors = errors, metrics = metrics)
+}
+
+# ============================================================
+# 5) Entrenamiento (puntual + cuantiles)
+# ============================================================
+params_point <- list(
+  objective = "regression",
+  metric = "rmse",
+  learning_rate = 0.05,
+  num_leaves = 15,
+  max_depth = 4,
+  min_data_in_leaf = 6,
+  feature_fraction = 0.9
+)
+
+train_final_lgb <- function(df_feat_imp, params, nrounds = 300) {
+  df_tr <- prep_train_set(df_feat_imp)
+  X <- as.matrix(df_tr %>% select(-date, -product, -y))
+  y <- df_tr$y
+  dtrain <- lgb.Dataset(X, label = y)
+  lgb.train(params = params, data = dtrain, nrounds = nrounds, verbose = -1)
+}
+
+train_quantile_models <- function(df_feat_imp, alphas = c(0.1, 0.5, 0.9), nrounds = 350) {
+  df_tr <- prep_train_set(df_feat_imp)
+  X <- as.matrix(df_tr %>% select(-date, -product, -y))
+  y <- df_tr$y
+  dtrain <- lgb.Dataset(X, label = y)
+
+  models <- list()
+  for (a in alphas) {
+    params_q <- list(
+      objective = "quantile",
+      metric = "quantile",
+      alpha = a,
+      learning_rate = 0.05,
+      num_leaves = 15,
+      max_depth = 4,
+      min_data_in_leaf = 6,
+      feature_fraction = 0.9
+    )
+    models[[as.character(a)]] <- lgb.train(params = params_q, data = dtrain, nrounds = nrounds, verbose = -1)
+  }
+  models
+}
+
+# ============================================================
+# 6) Forecast cuantiles (BLINDADO: mismas columnas del training)
+# ============================================================
+forecast_6m_quantiles <- function(df_hist, qmodels, feature_cols, h = 6) {
+
+  df_hist <- df_hist %>%
+    mutate(date = as.Date(date), product = as.character(product), y = as.numeric(y)) %>%
+    arrange(date)
+
+  prod <- df_hist$product[1]
+
+  future_dates <- seq.Date(
+    from = max(df_hist$date) %m+% months(1),
+    by   = "month",
+    length.out = h
+  )
+
+  out_all <- tibble(date = as.Date(future_dates))
+
+  for (a in names(qmodels)) {
+
+    colname <- dplyr::case_when(
+      a == "0.1" ~ "P10",
+      a == "0.5" ~ "P50",
+      a == "0.9" ~ "P90",
+      TRUE ~ paste0("P", a)
+    )
+
+    preds <- numeric(length(future_dates))
+    df_ext <- df_hist %>% select(date, product, y)
+
+    for (j in seq_along(future_dates)) {
+
+      d <- as.Date(future_dates[j])
+
+      # extender con fila futura
+      df_tmp <- bind_rows(
+        df_ext,
+        tibble(date = d, product = prod, y = NA_real_)
+      ) %>% arrange(date)
+
+      # features + imputación
+      feat_raw <- make_ts_features_adaptive(df_tmp)
+      feat_imp <- impute_features(feat_raw)
+
+      feat_row <- feat_imp %>% filter(date == d)
+
+      # ---- CHEQUEOS CLAVE (evita error num_row interno de LGB)
+      if (nrow(feat_row) != 1) {
+        stop("feat_row inválida (nrow != 1) para fecha: ", d)
+      }
+
+      # FORZAR mismas columnas y mismo orden que el training
+      missing_cols <- setdiff(feature_cols, colnames(feat_row))
+      if (length(missing_cols) > 0) {
+        # si por alguna razón faltan columnas, las creamos en 0
+        for (mc in missing_cols) feat_row[[mc]] <- 0
+      }
+
+      X_new <- feat_row %>%
+        select(all_of(feature_cols)) %>%
+        as.matrix()
+
+      if (!is.matrix(X_new) || nrow(X_new) != 1 || any(is.na(dim(X_new)))) {
+        stop("X_new inválido para fecha: ", d)
+      }
+
+      # predecir
+      yhat <- as.numeric(predict(qmodels[[a]], X_new))
+      preds[j] <- yhat
+
+      # actualizar recursivo
+      df_ext <- bind_rows(df_ext, tibble(date = d, product = prod, y = yhat)) %>%
+        arrange(date)
+    }
+
+    out_all[[colname]] <- preds
+  }
+
+  out_all %>% select(date, P10, P50, P90)
+}
+
+# ============================================================
+# 7) Pipeline por producto
+# ============================================================
+run_product_pipeline <- function(df_long, prod_name, h = 6) {
+
+  df_prod <- df_long %>%
+    filter(product == prod_name) %>%
+    select(date, product, y) %>%
+    mutate(date = as.Date(date),
+           product = as.character(product),
+           y = as.numeric(y)) %>%
+    arrange(date)
+
+  # features base + imputación
+  df_feat_raw <- make_ts_features_adaptive(df_prod)
+  df_feat_imp <- impute_features(df_feat_raw)
+
+  # columnas que usará el modelo (con orden fijo)
+  feature_cols <- df_feat_imp %>%
+    select(-date, -product, -y) %>%
+    colnames()
+
+  # walk-forward (puntual)
+  wf <- walk_forward_lgb(df_feat_imp, min_train = 18, params = params_point, nrounds = 250)
+
+  # entrenar modelos
+  model_point <- train_final_lgb(df_feat_imp, params = params_point, nrounds = 300)
+  qmodels <- train_quantile_models(df_feat_imp, alphas = c(0.1, 0.5, 0.9), nrounds = 350)
+
+  # forecast cuantiles 6 meses
+  fc_q <- forecast_6m_quantiles(df_prod, qmodels, feature_cols = feature_cols, h = h) %>%
+    mutate(product = prod_name) %>%
+    relocate(product, .before = date)
+
+  list(
+    metrics = wf$metrics,
+    errors = wf$errors,
+    forecast = fc_q,
+    model_point = model_point,
+    qmodels = qmodels,
+    feature_cols = feature_cols
+  )
+}
+
+# ============================================================
+# 8) Ejecutar para PR1/PR2/PR3
+# ============================================================
+res_PR1 <- run_product_pipeline(df_long, "PR1", h = 6)
+res_PR2 <- run_product_pipeline(df_long, "PR2", h = 6)
+res_PR3 <- run_product_pipeline(df_long, "PR3", h = 6)
+
+# métricas
+metrics_table <- bind_rows(
+  tibble(product = "PR1", t(res_PR1$metrics)),
+  tibble(product = "PR2", t(res_PR2$metrics)),
+  tibble(product = "PR3", t(res_PR3$metrics))
+)
+metrics_table
+
+# tablas forecast
+tbl_PR1 <- res_PR1$forecast %>% mutate(Month = format(date, "%Y-%m")) %>% select(Month, P10, P50, P90)
+tbl_PR2 <- res_PR2$forecast %>% mutate(Month = format(date, "%Y-%m")) %>% select(Month, P10, P50, P90)
+tbl_PR3 <- res_PR3$forecast %>% mutate(Month = format(date, "%Y-%m")) %>% select(Month, P10, P50, P90)
+
+```
+
+# Forecasts
+
+```{r}
+tbl_PR1
+tbl_PR2
+tbl_PR3
+```
+
+

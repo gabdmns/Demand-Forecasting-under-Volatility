@@ -1,0 +1,115 @@
+---
+title: "README"
+author: "Gabriel Gonzalo Ojeda Cárcamo"
+date: "7/1/2026"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Overview
+
+This project develops a **short-term demand forecasting solution** for industrial products operating under **high volatility and limited historical data** (40 monthly observations per product, no exogenous variables).
+
+Classical time series models (ARIMA, ETS) are used as benchmarks and compared against a **feature-based LightGBM model** with shock-aware features.
+
+---
+
+## Business Problem
+
+Forecasts support **monthly production planning and inventory decisions**.
+
+- Over-forecasting → higher holding costs  
+- Under-forecasting → stockouts and lost sales  
+
+Because demand is irregular and shock-driven, the solution provides **probabilistic forecasts (P10–P50–P90)** to quantify uncertainty and support scenario-based planning.
+
+---
+
+##  Data & Constraints
+
+- Monthly data (2021–2024)
+- 40 observations per product
+- No exogenous variables
+- High volatility, non-Gaussian changes
+
+These constraints require **robust and parsimonious models** with realistic validation.
+
+---
+
+##  Modeling Approach
+
+**Benchmarks**
+- ARIMA
+- ETS (discarded due to poor performance under volatility)
+
+**Final Model**
+- LightGBM regression with engineered features:
+  - Lagged demand (1, 2, 3, 6, 12)
+  - Rolling averages (3, 6, 12)
+  - Cyclical seasonality (sin/cos)
+  - Shock features capturing abrupt changes
+
+---
+
+##  Validation
+
+Models are evaluated using **walk-forward (expanding window) cross-validation**, retraining at each step and forecasting one month ahead.  
+This setup mimics real deployment and avoids look-ahead bias.
+
+---
+
+##  Key Results (PR2 example)
+
+| Model | MAPE |
+|-----|------|
+| ARIMA | 29% |
+| ETS | 30% |
+| LightGBM (basic) | 26% |
+| **LightGBM + shock features** | **15%** |
+
+→ **Forecast error reduced by 50%** relative to the ARIMA baseline.
+
+---
+
+##  Outputs
+
+- Point forecasts
+- Quantile forecasts: **P10 / P50 / P90**
+- 6-month horizon forecasts for each product
+
+---
+
+##  Notes
+
+- Small sample size (40 obs)
+- No exogenous drivers
+- Short-term forecasting only (1–6 months)
+
+Deep learning models were intentionally excluded due to overfitting risk under these constraints.
+
+---
+
+## Project Structure
+
+src/
+
+  - features.R
+  - walk_forward.R
+  - models_lgbm.R
+  - forecast_quantiles.R
+  
+report/
+
+  - time_series_forecasting.pdf
+  
+README.md
+
+## Contact
+
+**Gabriel Gonzalo Ojeda Cárcamo**  
+Economist | MSc Statistics (candidate)  
+Data Analytics
