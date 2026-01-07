@@ -1,5 +1,5 @@
 ---
-title: "Proyeccion ARIMA/ETS"
+title: "Demand Forecasting under Volatility"
 author: "Gabriel Gonzalo Ojeda Cárcamo"
 date: "7/1/2026"
 output: pdf_document
@@ -168,6 +168,8 @@ A feature-based LightGBM model outperformed all classical approaches. After inco
 - Irregular shocks → tree-based model with shock features
 
 - Forecast horizon short (1–6 months) → no long-term trend modeling
+
+Deep learning approaches (LSTM/Transformers) were intentionally not considered due to the very short sample size and high risk of overfitting.
 
 ```{r}
 #TRAIN/TEST
